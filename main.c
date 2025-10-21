@@ -6,10 +6,20 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <time.h> //new
 
 #include "math_parser.h"
 #include "bitmap_font.h"
 
+#include "benchmark.h"
+#include "z_cache.h"
+
+// Глобальные переменные (добавь к другим глобальным переменным)
+int optimization_enabled = 1; // 1 - включено, 0 - выключено
+
+// Объявления функций отрисовки которые используются в benchmark.c
+void draw_rect(float x, float y, float width, float height, float r, float g, float b);
+void draw_text_bitmap(float x, float y, const char* text, float scale);
 
 // Масштаб функции
 float scale_factor = 0.5f;
@@ -22,6 +32,13 @@ void error_callback(int error, const char* description) {
 #define WIDTH 800
 #define HEIGHT 600
 #define MAX_FUNCTION_LENGTH 256
+
+
+// Глобальные переменные (в начале файла)
+Benchmark benchmark = {0, 0, 0, ""};
+ZCache z_cache;
+
+
 
 // Состояния приложения
 typedef enum {
@@ -145,6 +162,14 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
                 if (scale_factor > 3.0f) scale_factor = 3.0f; // Максимальный масштаб
             } else if (key == GLFW_KEY_ESCAPE) {
                 current_state = STATE_MENU;
+            }else if (key == GLFW_KEY_O) {
+                optimization_enabled = !optimization_enabled;
+                printf("Оптимизация %s\n", optimization_enabled ? "ВКЛЮЧЕНА" : "ВЫКЛЮЧЕНА");
+                
+                // При выключении оптимизации освобождаем кэш
+                if (!optimization_enabled) {
+                    zcache_free(&z_cache);
+                }
             }
         }
     }
@@ -267,25 +292,75 @@ void draw_axes() {
 }
 
 void draw_function() {
-    // Определяем область рисования в зависимости от функции
+    double start_calc_time = get_current_time_ms();
+    
+    // Определяем область рисования
     float x_min = -5.0f, x_max = 5.0f;
     float y_min = -5.0f, y_max = 5.0f;
     float step = 0.2f;
     
-    // Для функций с ограниченной областью определения используем меньшую область
     if (strstr(user_function, "sqrt(1-x^2-y^2)") != NULL) {
         x_min = -1.2f; x_max = 1.2f;
         y_min = -1.2f; y_max = 1.2f;
         step = 0.05f;
     }
     
+    // Создаем/обновляем кэш если нужно и оптимизация включена
+    if (optimization_enabled && (!zcache_is_valid(&z_cache, x_min, x_max, y_min, y_max, step, user_function))) {
+        zcache_free(&z_cache);
+        
+        z_cache.width = (int)((x_max - x_min) / step) + 2;
+        z_cache.height = (int)((y_max - y_min) / step) + 2;
+        z_cache.x_min = x_min;
+        z_cache.x_max = x_max;
+        z_cache.y_min = y_min;
+        z_cache.y_max = y_max;
+        z_cache.step = step;
+        strcpy(z_cache.last_function, user_function);
+        
+        // Выделяем память для кэша
+        z_cache.data = (float**)malloc(z_cache.height * sizeof(float*));
+        for (int i = 0; i < z_cache.height; i++) {
+            z_cache.data[i] = (float*)malloc(z_cache.width * sizeof(float));
+            for (int j = 0; j < z_cache.width; j++) {
+                z_cache.data[i][j] = NAN;
+            }
+        }
+    }
+    
+    // Подсчет точек
+    int point_count = 0;
+    for (float x = x_min; x < x_max; x += step) {
+        for (float y = y_min; y < y_max; y += step) {
+            point_count += 4;
+        }
+    }
+    
+    double end_calc_time = get_current_time_ms();
+    benchmark.calculation_time = end_calc_time - start_calc_time;
+    benchmark.point_count = point_count;
+    
+    // ОТРИСОВКА с использованием кэша или без
+    double start_render_time = get_current_time_ms();
+    
     glBegin(GL_TRIANGLES);
     for (float x = x_min; x < x_max; x += step) {
         for (float y = y_min; y < y_max; y += step) {
-            float z1 = evaluate_function(x, y, user_function) * scale_factor;
-            float z2 = evaluate_function(x + step, y, user_function) * scale_factor;
-            float z3 = evaluate_function(x, y + step, user_function) * scale_factor;
-            float z4 = evaluate_function(x + step, y + step, user_function) * scale_factor;
+            float z1, z2, z3, z4;
+            
+            if (optimization_enabled) {
+                // Используем кэшированные значения
+                z1 = zcache_get(&z_cache, x, y, user_function, scale_factor);
+                z2 = zcache_get(&z_cache, x + step, y, user_function, scale_factor);
+                z3 = zcache_get(&z_cache, x, y + step, user_function, scale_factor);
+                z4 = zcache_get(&z_cache, x + step, y + step, user_function, scale_factor);
+            } else {
+                // Вычисляем напрямую
+                z1 = evaluate_function(x, y, user_function) * scale_factor;
+                z2 = evaluate_function(x + step, y, user_function) * scale_factor;
+                z3 = evaluate_function(x, y + step, user_function) * scale_factor;
+                z4 = evaluate_function(x + step, y + step, user_function) * scale_factor;
+            }
 
             // Заменяем NaN на 0 вместо пропуска треугольника
             if (isnan(z1)) z1 = 0.0f;
@@ -316,7 +391,6 @@ void draw_function() {
             float color3 = (z3 + limit) / (2.0f * limit);
             float color4 = (z4 + limit) / (2.0f * limit);
 
-
             // Первый треугольник
             if (fabs(z1) < 0.01f) glColor3f(0.7f, 0.7f, 0.7f); else glColor3f(color1, 1.0f - color1, 0.0f);
             glVertex3f(x, y, z1);
@@ -332,12 +406,18 @@ void draw_function() {
             glVertex3f(x + step, y + step, z4);
             if (fabs(z3) < 0.01f) glColor3f(0.7f, 0.7f, 0.7f); else glColor3f(color3, 1.0f - color3, 0.0f);
             glVertex3f(x, y + step, z3);
-
-
-
         }
     }
     glEnd();
+    
+    double end_render_time = get_current_time_ms();
+    benchmark.rendering_time = end_render_time - start_render_time;
+    
+    // Проверяем, изменилась ли функция
+    if (strcmp(benchmark.last_function, user_function) != 0) {
+        strcpy(benchmark.last_function, user_function);
+        print_benchmark_results(&benchmark);
+    }
 }
 
 
@@ -408,7 +488,40 @@ int main(void) {
     printf("В меню: введите функцию и нажмите START или Enter\n");
     printf("В режиме визуализации: стрелки - вращение камеры, ESC - возврат в меню\n");
 
+    init_benchmark();
+    zcache_init(&z_cache);
+
     while (!glfwWindowShouldClose(window)) {
+        double current_time = get_current_time_seconds();
+        
+        // Расчет FPS с усреднением
+        frame_count++;
+        
+        // Сохраняем время кадра для усреднения
+        static double last_frame_time = 0.0;
+        double frame_time = current_time - last_frame_time;
+        last_frame_time = current_time;
+        
+        frame_times[frame_time_index] = frame_time;
+        frame_time_index = (frame_time_index + 1) % 60;
+        
+        // Обновляем FPS каждую секунду с усреднением
+        if (current_time - last_fps_time >= 0.5) { // Чаще обновляем, но усредняем
+            double avg_frame_time = 0.0;
+            for (int i = 0; i < 60; i++) {
+                avg_frame_time += frame_times[i];
+            }
+            avg_frame_time /= 60;
+            
+            if (avg_frame_time > 0.0) {
+                fps = 1.0 / avg_frame_time;
+            }
+            
+            frame_count = 0;
+            last_fps_time = current_time;
+        }
+
+
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         if (current_state == STATE_MENU) {
@@ -443,6 +556,9 @@ int main(void) {
             // Рисуем функцию
             draw_function();
 
+            // Отрисовываем FPS в углу экрана
+            draw_fps_display();
+
             // Обновляем заголовок окна с информацией о функции
             char title[512];
             snprintf(title, sizeof(title), "3D Function Visualizer - f(x,y) = %s", user_function);
@@ -455,5 +571,7 @@ int main(void) {
 
     glfwDestroyWindow(window);
     glfwTerminate();
+
+    zcache_free(&z_cache);
     return 0;
 }
